@@ -1,0 +1,19 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "task-manager-day01"
+region = "ap-south-1"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+region = "ap-south-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+tags = "project=day01"
+s3_prefix = "task-manager-day01"
+parameter_overrides = "DevOrigin=\"http://localhost:5173\""
+image_repositories = []
