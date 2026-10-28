@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Day 1 - Task Management App (S3 + CloudFront + HTTP API + Lambda/Express + DynamoDB)
+Description: Task Manager v2 - admin dashboard (S3 + CloudFront + HTTP API + Lambda/Express + DynamoDB)
 
 Parameters:
   DevOrigin:
@@ -37,7 +37,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref TasksTable
-      # Least privilege: only these five actions, only on this one table. No "*" resources.
+      # Least privilege: only these four actions, only on this one table. No "*" resources.
       Policies:
         - Version: "2012-10-17"
           Statement:

@@ -1,173 +1,185 @@
-import { useEffect, useMemo, useState } from "react";
-import { listTasks, createTask, updateTask, deleteTask } from "./api.js";
+import { useCallback, useEffect, useState } from "react";
+import {
+  createTask,
+  deleteTask,
+  getCategories,
+  getStats,
+  listTasks,
+  updateTask,
+  isOverdue,
+} from "./api.js";
+import Sidebar from "./components/Sidebar.jsx";
+import Topbar from "./components/Topbar.jsx";
+import Dashboard from "./components/Dashboard.jsx";
+import TasksPage from "./components/TasksPage.jsx";
+import CategoriesPage from "./components/CategoriesPage.jsx";
+import TaskPanel from "./components/TaskPanel.jsx";
 
-const FILTERS = [
-  { id: "all", label: "All" },
-  { id: "open", label: "To do" },
-  { id: "done", label: "Done" },
-];
-
-const EMPTY = {
-  all: "No tasks yet. Add your first one above.",
-  open: "Nothing left to do.",
-  done: "No finished tasks yet.",
+const safeGet = (k) => {
+  try { return localStorage.getItem(k); } catch { return null; }
+};
+const safeSet = (k, v) => {
+  try { localStorage.setItem(k, v); } catch { /* storage unavailable */ }
 };
 
 export default function App() {
-  const [tasks, setTasks] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [title, setTitle] = useState("");
-  const [filter, setFilter] = useState("all");
-  const [editingId, setEditingId] = useState(null);
-  const [draft, setDraft] = useState("");
+  const [page, setPage] = useState("dashboard");
+  const [dark, setDark] = useState(() => safeGet("tm-theme") === "dark");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [filters, setFilters] = useState({ status: "all", priority: "", category: "" });
+
+  // Unfiltered data for the dashboard, categories page and dropdowns.
+  const [allTasks, setAllTasks] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [categories, setCategories] = useState([]);
+  const [version, setVersion] = useState(0); // bumps after every change so the table refetches
+
+  const [panel, setPanel] = useState({ open: false, task: null });
+  const [toast, setToast] = useState(null); // { kind, text }
+
+  const showError = useCallback((text) => setToast({ kind: "error", text }), []);
 
   useEffect(() => {
-    listTasks()
-      .then(setTasks)
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, []);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    safeSet("tm-theme", dark ? "dark" : "light");
+  }, [dark]);
 
-  const openCount = tasks.filter((t) => !t.done).length;
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), toast.kind === "error" ? 6000 : 2500);
+    return () => clearTimeout(t);
+  }, [toast]);
 
-  // The API returns oldest first; show newest first.
-  const visible = useMemo(
-    () =>
-      [...tasks]
-        .reverse()
-        .filter((t) => (filter === "all" ? true : filter === "done" ? t.done : !t.done)),
-    [tasks, filter]
-  );
-
-  async function run(action) {
-    setError("");
+  const refresh = useCallback(async () => {
     try {
-      await action();
+      const [tasks, s, c] = await Promise.all([listTasks(), getStats(), getCategories()]);
+      setAllTasks(tasks);
+      setStats(s);
+      setCategories(c);
+      setVersion((v) => v + 1);
     } catch (e) {
-      setError(e.message);
+      showError(e.message);
+      setAllTasks((prev) => prev ?? []);
+    }
+  }, [showError]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const navigate = (p) => {
+    setPage(p);
+    setMenuOpen(false);
+  };
+
+  const onSearch = (value) => {
+    setSearch(value);
+    if (value && page !== "tasks") setPage("tasks");
+  };
+
+  const openAdd = () => setPanel({ open: true, task: null });
+  const openEdit = (task) => setPanel({ open: true, task });
+  const closePanel = useCallback(() => setPanel((p) => ({ ...p, open: false })), []);
+
+  async function save(fields) {
+    if (panel.task) {
+      await updateTask(panel.task.taskId, fields);
+      setToast({ kind: "ok", text: "Task updated" });
+    } else {
+      await createTask(fields);
+      setToast({ kind: "ok", text: "Task created" });
+    }
+    closePanel();
+    await refresh();
+  }
+
+  async function toggle(task) {
+    try {
+      await updateTask(task.taskId, { done: !task.done });
+      await refresh();
+    } catch (e) {
+      showError(e.message);
     }
   }
 
-  const replace = (updated) =>
-    setTasks((prev) => prev.map((t) => (t.taskId === updated.taskId ? updated : t)));
+  async function remove(task) {
+    if (!window.confirm(`Delete "${task.title}"? This can't be undone.`)) return;
+    try {
+      await deleteTask(task.taskId);
+      setToast({ kind: "ok", text: "Task deleted" });
+      await refresh();
+    } catch (e) {
+      showError(e.message);
+    }
+  }
 
-  const add = (e) => {
-    e.preventDefault();
-    const value = title.trim();
-    if (!value) return;
-    run(async () => {
-      const task = await createTask(value);
-      setTasks((prev) => [...prev, task]);
-      setTitle("");
-    });
+  const openCategory = (name) => {
+    setFilters({ status: "all", priority: "", category: name });
+    setSearch("");
+    navigate("tasks");
   };
 
-  const toggle = (task) =>
-    run(async () => replace(await updateTask(task.taskId, { done: !task.done })));
-
-  const saveEdit = (task) =>
-    run(async () => {
-      const value = draft.trim();
-      if (value && value !== task.title) replace(await updateTask(task.taskId, { title: value }));
-      setEditingId(null);
-    });
-
-  const remove = (task) =>
-    run(async () => {
-      await deleteTask(task.taskId);
-      setTasks((prev) => prev.filter((t) => t.taskId !== task.taskId));
-    });
+  const overdueCount = stats?.overdue ?? (allTasks ?? []).filter(isOverdue).length;
 
   return (
-    <main className="shell">
-      <header className="head">
-        <h1>Tasks</h1>
-        <p className="count">
-          {loading ? "Loading…" : openCount === 0 ? "All done" : `${openCount} left to do`}
-        </p>
-      </header>
-
-      <form className="add" onSubmit={add}>
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="What needs doing?"
-          maxLength={200}
-          aria-label="New task"
+    <div className="shell">
+      <Sidebar
+        page={page}
+        onNavigate={navigate}
+        open={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        overdueCount={overdueCount}
+      />
+      <div className="main">
+        <Topbar
+          search={search}
+          onSearch={onSearch}
+          dark={dark}
+          onToggleDark={() => setDark((d) => !d)}
+          onMenu={() => setMenuOpen(true)}
         />
-        <button type="submit" disabled={!title.trim()}>
-          Add task
-        </button>
-      </form>
-
-      <div role="alert" className={error ? "error" : "error hidden"}>
-        {error}
-      </div>
-
-      <div className="filters" role="tablist" aria-label="Filter tasks">
-        {FILTERS.map((f) => (
-          <button
-            key={f.id}
-            role="tab"
-            aria-selected={filter === f.id}
-            className={filter === f.id ? "tab on" : "tab"}
-            onClick={() => setFilter(f.id)}
-          >
-            {f.label}
-          </button>
-        ))}
-      </div>
-
-      {!loading && visible.length === 0 && <p className="empty">{EMPTY[filter]}</p>}
-
-      <ul className="list">
-        {visible.map((task) => (
-          <li key={task.taskId} className={task.done ? "item done" : "item"}>
-            <input
-              type="checkbox"
-              checked={task.done}
-              onChange={() => toggle(task)}
-              aria-label={`Mark "${task.title}" as ${task.done ? "to do" : "done"}`}
+        <main className="content">
+          {page === "dashboard" && (
+            <Dashboard
+              stats={stats}
+              tasks={allTasks ?? []}
+              onToggle={toggle}
+              onViewAll={() => navigate("tasks")}
+              onAdd={openAdd}
             />
+          )}
+          {page === "tasks" && (
+            <TasksPage
+              search={search}
+              version={version}
+              categories={categories}
+              filters={filters}
+              onFilters={setFilters}
+              onToggle={toggle}
+              onEdit={openEdit}
+              onDelete={remove}
+              onAdd={openAdd}
+              onError={showError}
+            />
+          )}
+          {page === "categories" && (
+            <CategoriesPage tasks={allTasks ?? []} onOpen={openCategory} onAdd={openAdd} />
+          )}
+        </main>
+      </div>
 
-            {editingId === task.taskId ? (
-              <input
-                className="edit"
-                autoFocus
-                value={draft}
-                maxLength={200}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") saveEdit(task);
-                  if (e.key === "Escape") setEditingId(null);
-                }}
-                onBlur={() => saveEdit(task)}
-                aria-label="Edit task title"
-              />
-            ) : (
-              <span className="title">{task.title}</span>
-            )}
+      <TaskPanel
+        open={panel.open}
+        task={panel.task}
+        categories={categories}
+        onClose={closePanel}
+        onSave={save}
+      />
 
-            <div className="actions">
-              {editingId !== task.taskId && (
-                <button
-                  className="ghost"
-                  onClick={() => {
-                    setEditingId(task.taskId);
-                    setDraft(task.title);
-                  }}
-                >
-                  Edit
-                </button>
-              )}
-              <button className="ghost danger" onClick={() => remove(task)}>
-                Delete
-              </button>
-            </div>
-          </li>
-        ))}
-      </ul>
-    </main>
+      {toast && (
+        <div className={`toast ${toast.kind}`} role="status" onClick={() => setToast(null)}>
+          {toast.text}
+        </div>
+      )}
+    </div>
   );
 }

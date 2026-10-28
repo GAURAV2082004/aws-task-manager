@@ -17,10 +17,27 @@ async function request(path, options = {}) {
   return data;
 }
 
-export const listTasks = () => request("/tasks");
-export const createTask = (title) =>
-  request("/tasks", { method: "POST", body: JSON.stringify({ title }) });
+/** Local YYYY-MM-DD (not UTC) so "today" matches the user's calendar. */
+export function todayStr() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+export const isOverdue = (t) => !t.done && !!t.dueDate && t.dueDate < todayStr();
+
+export function listTasks(filters = {}) {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(filters))
+    if (v !== undefined && v !== null && v !== "") q.set(k, v);
+  const s = q.toString();
+  return request("/tasks" + (s ? `?${s}` : ""));
+}
+export const createTask = (fields) =>
+  request("/tasks", { method: "POST", body: JSON.stringify(fields) });
 export const updateTask = (taskId, patch) =>
   request(`/tasks/${encodeURIComponent(taskId)}`, { method: "PUT", body: JSON.stringify(patch) });
 export const deleteTask = (taskId) =>
   request(`/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+export const getCategories = () => request("/categories");
+export const getStats = () => request(`/stats?today=${todayStr()}`);

@@ -1,22 +1,64 @@
-// All table access lives in this file so the routes stay clean.
-//
-// Table design (Day 1):
-//   partition key  userId  (fixed "demo-user" until Cognito arrives on Day 3)
-//   sort key       taskId  (time-sortable, so a Query returns tasks in creation order)
-//
-// Locally, when TABLE_NAME is not set, an in-memory store is used so you can
-// build the UI without touching AWS.
+/**
+ * db.js — data access layer.
+ * Uses DynamoDB when TABLE_NAME is set, otherwise an in-memory Map (local dev / tests).
+ *
+ * Task schema:
+ *   userId (PK) string          taskId (SK) string, time-sortable
+ *   title string                description string
+ *   done boolean                priority "high" | "medium" | "low"
+ *   dueDate "YYYY-MM-DD" | null category string
+ *   createdAt ISO-8601          updatedAt ISO-8601
+ */
+const { randomBytes } = require("crypto");
 
-const { randomUUID } = require("node:crypto");
+const now = () => new Date().toISOString();
 
-const TABLE = process.env.TABLE_NAME;
+// Time-sortable id: base36 timestamp + random suffix. No dependencies.
+function newId() {
+  const ts = Date.now().toString(36).padStart(9, "0");
+  return `${ts}-${randomBytes(6).toString("base64url")}`;
+}
 
-// Sortable id: base36 timestamp + random suffix.
-const newTaskId = () =>
-  `${Date.now().toString(36).padStart(9, "0")}-${randomUUID().slice(0, 8)}`;
+function buildTask(userId, f) {
+  const ts = now();
+  return {
+    userId,
+    taskId: newId(),
+    title: f.title,
+    description: f.description ?? "",
+    done: f.done ?? false,
+    priority: f.priority ?? "medium",
+    dueDate: f.dueDate ?? null,
+    category: f.category ?? "General",
+    createdAt: ts,
+    updatedAt: ts,
+  };
+}
 
-// ---------- DynamoDB implementation ----------
-function dynamoStore() {
+// Shared by both backends. Filters are already validated by app.js.
+function applyFilters(items, { done, priority, category, search } = {}) {
+  let out = items;
+  if (done !== undefined) out = out.filter((t) => t.done === done);
+  if (priority) out = out.filter((t) => t.priority === priority);
+  if (category) out = out.filter((t) => t.category === category);
+  if (search) {
+    const q = search.toLowerCase();
+    out = out.filter(
+      (t) =>
+        t.title.toLowerCase().includes(q) ||
+        (t.description || "").toLowerCase().includes(q)
+    );
+  }
+  return out;
+}
+
+const uniqueCategories = (items) =>
+  [...new Set(items.map((t) => t.category).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b)
+  );
+
+if (process.env.TABLE_NAME) {
+  /* ─── DynamoDB ─────────────────────────────────────────────────────── */
   const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
   const {
     DynamoDBDocumentClient,
@@ -26,72 +68,72 @@ function dynamoStore() {
     DeleteCommand,
   } = require("@aws-sdk/lib-dynamodb");
 
-  // Created outside the handler so warm Lambda invocations reuse the client.
-  const doc = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+  const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+  const TABLE = process.env.TABLE_NAME;
+  const isConditionFailure = (e) => e?.name === "ConditionalCheckFailedException";
 
-  return {
-    async list(userId) {
-      const out = await doc.send(
+  // One Query per user, paginated. Filtering happens in memory: a personal task
+  // list is small, and this avoids a GSI per filter combination.
+  async function all(userId) {
+    const items = [];
+    let ExclusiveStartKey;
+    do {
+      const res = await ddb.send(
         new QueryCommand({
           TableName: TABLE,
           KeyConditionExpression: "userId = :u",
           ExpressionAttributeValues: { ":u": userId },
+          ExclusiveStartKey,
         })
       );
-      return out.Items ?? [];
+      items.push(...(res.Items ?? []));
+      ExclusiveStartKey = res.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    return items;
+  }
+
+  module.exports = {
+    async list(userId, filters) {
+      return applyFilters(await all(userId), filters);
     },
 
-    async create(userId, { title }) {
-      const now = new Date().toISOString();
-      const item = {
-        userId,
-        taskId: newTaskId(),
-        title,
-        done: false,
-        createdAt: now,
-        updatedAt: now,
-      };
-      await doc.send(new PutCommand({ TableName: TABLE, Item: item }));
-      return item;
+    async create(userId, fields) {
+      const task = buildTask(userId, fields);
+      await ddb.send(new PutCommand({ TableName: TABLE, Item: task }));
+      return task;
     },
 
     async update(userId, taskId, patch) {
-      const names = { "#u": "updatedAt" };
-      const values = { ":u": new Date().toISOString() };
-      const sets = ["#u = :u"];
-      if (patch.title !== undefined) {
-        names["#t"] = "title";
-        values[":t"] = patch.title;
-        sets.push("#t = :t");
-      }
-      if (patch.done !== undefined) {
-        names["#d"] = "done";
-        values[":d"] = patch.done;
-        sets.push("#d = :d");
+      const names = { "#updatedAt": "updatedAt" };
+      const values = { ":updatedAt": now() };
+      const sets = ["#updatedAt = :updatedAt"];
+      for (const [k, v] of Object.entries(patch)) {
+        names[`#${k}`] = k;
+        values[`:${k}`] = v;
+        sets.push(`#${k} = :${k}`);
       }
       try {
-        const out = await doc.send(
+        const res = await ddb.send(
           new UpdateCommand({
             TableName: TABLE,
             Key: { userId, taskId },
+            ConditionExpression: "attribute_exists(taskId)", // 404 instead of silently creating
             UpdateExpression: `SET ${sets.join(", ")}`,
-            // Without this, UpdateItem would silently create a new item (upsert).
-            ConditionExpression: "attribute_exists(taskId)",
             ExpressionAttributeNames: names,
             ExpressionAttributeValues: values,
             ReturnValues: "ALL_NEW",
           })
         );
-        return out.Attributes;
-      } catch (err) {
-        if (err.name === "ConditionalCheckFailedException") return null;
-        throw err;
+        return res.Attributes ?? null;
+      } catch (e) {
+        if (isConditionFailure(e)) return null;
+        throw e;
       }
     },
 
     async remove(userId, taskId) {
       try {
-        await doc.send(
+        await ddb.send(
           new DeleteCommand({
             TableName: TABLE,
             Key: { userId, taskId },
@@ -99,48 +141,53 @@ function dynamoStore() {
           })
         );
         return true;
-      } catch (err) {
-        if (err.name === "ConditionalCheckFailedException") return false;
-        throw err;
+      } catch (e) {
+        if (isConditionFailure(e)) return false;
+        throw e;
       }
     },
+
+    async categories(userId) {
+      return uniqueCategories(await all(userId));
+    },
   };
-}
+} else {
+  /* ─── In-memory (local dev, tests) ─────────────────────────────────── */
+  const store = new Map(); // userId -> task[]
+  const tasksOf = (userId) => {
+    if (!store.has(userId)) store.set(userId, []);
+    return store.get(userId);
+  };
 
-// ---------- In-memory implementation (local dev and tests) ----------
-function memoryStore() {
-  const rows = new Map(); // key: `${userId}|${taskId}`
-  const key = (u, t) => `${u}|${t}`;
+  module.exports = {
+    async list(userId, filters) {
+      return applyFilters([...tasksOf(userId)], filters);
+    },
 
-  return {
-    async list(userId) {
-      return [...rows.values()]
-        .filter((r) => r.userId === userId)
-        .sort((a, b) => a.taskId.localeCompare(b.taskId));
+    async create(userId, fields) {
+      const task = buildTask(userId, fields);
+      tasksOf(userId).push(task);
+      return task;
     },
-    async create(userId, { title }) {
-      const now = new Date().toISOString();
-      const item = {
-        userId,
-        taskId: newTaskId(),
-        title,
-        done: false,
-        createdAt: now,
-        updatedAt: now,
-      };
-      rows.set(key(userId, item.taskId), item);
-      return item;
-    },
+
     async update(userId, taskId, patch) {
-      const row = rows.get(key(userId, taskId));
-      if (!row) return null;
-      Object.assign(row, patch, { updatedAt: new Date().toISOString() });
-      return row;
+      const tasks = tasksOf(userId);
+      const i = tasks.findIndex((t) => t.taskId === taskId);
+      if (i === -1) return null;
+      tasks[i] = { ...tasks[i], ...patch, updatedAt: now() };
+      return tasks[i];
     },
+
     async remove(userId, taskId) {
-      return rows.delete(key(userId, taskId));
+      const tasks = tasksOf(userId);
+      const i = tasks.findIndex((t) => t.taskId === taskId);
+      if (i === -1) return false;
+      tasks.splice(i, 1);
+      return true;
+    },
+
+    async categories(userId) {
+      return uniqueCategories(tasksOf(userId));
     },
   };
 }
-
-module.exports = TABLE ? dynamoStore() : memoryStore();
