@@ -1,9 +1,5 @@
 # Task Manager on AWS (Serverless)
 
-A task manager (add, edit, complete, delete, filter) built on a serverless AWS stack and defined entirely in one SAM template. Day 1 of a 20-project AWS portfolio.
-
-**Cost: $0 on the AWS free tier** (S3, CloudFront, API Gateway, Lambda and DynamoDB on-demand all fit inside their free allowances at demo scale).
-
 ## Architecture
 
 ```mermaid
